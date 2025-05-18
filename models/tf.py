@@ -27,64 +27,13 @@ import torch
 import torch.nn as nn
 from tensorflow import keras
 
-from models.common import (C3, SPP, SPPF, Bottleneck, BottleneckCSP, C3x, Concat, Conv, CrossConv, DWConv, 
-                           DWConvTranspose2d, Focus, autopad, RestblockCSP, CSPResnext, Stem,FusionBlock, BottleneckCSPB, forward, CSPBlock, CSPResNext50, CSPResNext50WithFusion, EfficientMSFF)
+from models.common import (C3, SPP, SPPF, Bottleneck, BottleneckCSP, CSPBlock, C3x, Concat, Conv, CrossConv, DWConv,
+                           DWConvTranspose2d, Focus, autopad)
 from models.experimental import MixConv2d, attempt_load
 from models.yolo import Detect, Segment
 from utils.activations import SiLU
 from utils.general import LOGGER, make_divisible, print_args
 
-try:
-    import thop  # for FLOPs computation
-except ImportError:
-    thop = None
-
-class EfficientMSFF(nn.Module):
-    def __init__(self, channels):
-        super(EfficientMSFF, self).__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 1, stride=1, padding=0)
-        self.conv2 = nn.Conv2d(channels, channels, 3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(channels, channels, 1, stride=1, padding=0)
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        x1 = self.conv1(x[0])
-        x2 = self.conv2(x[1])
-        x3 = self.conv3(x[2])
-        x4 = self.conv3(x[3])
-        return self.relu(x1 + x2 + x3 + x4)
-
-class Detect(nn.Module):
-    # YOLOv5 Detect head for detection models
-    stride = None  # strides computed during build
-    dynamic = False  # force grid reconstruction
-    export = False  # export mode
-
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
-        super().__init__()
-        self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
-        self.nl = len(anchors)  # number of detection layers
-        self.na = len(anchors[0]) // 2  # number of anchors
-        self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
-        self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid
-        self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
-        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
-        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
-
-    def forward(self, x):
-        z = []  # inference output
-        self.training |= self.export
-        for i in range(self.nl):
-            x[i] = self.m[i](x[i])  # conv
-            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
-            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
-            if not self.training:
-                y = x[i].sigmoid()
-                y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                z.append(y.view(bs, -1, self.no))
-        return x if self.training else (torch.cat(z, 1), x)
 
 class TFBN(keras.layers.Layer):
     # TensorFlow BatchNormalization wrapper
@@ -447,25 +396,19 @@ def parse_model(d, ch, model, imgsz):  # model_dict, input_channels(3)
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in [
-                nn.Conv2d, Conv, DWConv, DWConvTranspose2d, Bottleneck, SPP, SPPF, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3x, RestblockCSP, RepConv,  CSPResnext, Stem,FusionBlock, BottleneckCSPB, CSPBlock, CSPResNext50, CSPResNext50WithFusion, EfficientMSFF]:
+                nn.Conv2d, Conv, DWConv, DWConvTranspose2d, Bottleneck, SPP,CSPBlock, SPPF, MixConv2d, Focus, CrossConv,
+                BottleneckCSP, C3, C3x]:
             c1, c2 = ch[f], args[0]
             c2 = make_divisible(c2 * gw, 8) if c2 != no else c2
 
             args = [c1, c2, *args[1:]]
-            if m in [BottleneckCSP, C3, C3x, RestblockCSP]:
+            if m in [BottleneckCSP, C3, C3x]:
                 args.insert(2, n)
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[-1 if x == -1 else x + 1] for x in f)
-        elif m is Chuncat:
-            c2 = sum([ch[x] for x in f])
-        elif m is Shortcut:
-            c2 = ch[f[0]]
-        elif m is Foldcut:
-            c2 = ch[f] // 2
         elif m in [Detect, Segment]:
             args.append([ch[x + 1] for x in f])
             if isinstance(args[1], int):  # number of anchors
